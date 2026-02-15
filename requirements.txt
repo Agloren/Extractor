@@ -1,3 +1,4 @@
 anthropic
 pymupdf
 python-dotenv
+streamlit
