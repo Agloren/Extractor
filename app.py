@@ -1,39 +1,35 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
 from anthropic import Anthropic
 import json
 import re
-import base64
 import io
 import subprocess
 import tempfile
 import os
 
-# ── CONFIG ─────────────────────────────────────────────────────────────
+# ── CONFIG ─────────────────────────────────────────
 st.set_page_config(page_title="AI Study Buddy", page_icon="📚", layout="wide")
 
-# ── CLIENTE API ─────────────────────────────────────────────────────────
+# ── API CLIENT ─────────────────────────────────────
 if "ANTHROPIC_API_KEY" in st.secrets:
     client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 else:
-    st.error("⚠️ No se encontró la API Key.")
+    st.error("⚠️ No se encontró ANTHROPIC_API_KEY en secrets.")
     st.stop()
 
-# ── SESSION STATE ───────────────────────────────────────────────────────
-if "sources" not in st.session_state:
-    st.session_state.sources = []
-if "combined_text" not in st.session_state:
-    st.session_state.combined_text = ""
-if "full_summary" not in st.session_state:
-    st.session_state.full_summary = ""
-if "analysis_done" not in st.session_state:
-    st.session_state.analysis_done = False
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "doc_info" not in st.session_state:
-    st.session_state.doc_info = {}
+# ── SESSION STATE ──────────────────────────────────
+for key, default in {
+    "sources": [],
+    "combined_text": "",
+    "full_summary": "",
+    "analysis_done": False,
+    "chat_history": []
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# ── UTILIDADES ──────────────────────────────────────────────────────────
+# ── UTILIDADES ─────────────────────────────────────
 def smart_truncate(text, max_chars=60000):
     if len(text) <= max_chars:
         return text
@@ -46,7 +42,7 @@ def safe_json_parse(raw):
         raw = re.sub(r"```json|```", "", raw).strip()
         return json.loads(raw)
 
-# ── EXTRACTORES ─────────────────────────────────────────────────────────
+# ── EXTRACTORES ────────────────────────────────────
 def extract_pdf(file_bytes, name):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     text = "".join([p.get_text() for p in doc if p.get_text().strip()])
@@ -90,47 +86,33 @@ def process_file(uploaded_file):
         st.warning(f"Formato .{ext} no soportado.")
         return None
 
-# ── BUILD TEXT ──────────────────────────────────────────────────────────
+# ── BUILD TEXT ─────────────────────────────────────
 def build_combined_text():
     return "\n\n".join([
         f"\n{'='*60}\n📁 FUENTE: {s['name']} ({s['type']})\n{'='*60}\n{s['text']}"
         for s in st.session_state.sources
     ])
 
-# ── RESUMEN ─────────────────────────────────────────────────────────────
+# ── RESUMEN ────────────────────────────────────────
 def generate_full_summary(combined_text):
-    total_pages = sum(s["pages"] for s in st.session_state.sources)
-
-    if total_pages <= 10:
-        max_tok = 1200
-    elif total_pages <= 50:
-        max_tok = 2500
-    else:
-        max_tok = 4000
-
     r = client.messages.create(
         model="claude-sonnet-4-5-20250929",
-        max_tokens=max_tok,
+        max_tokens=3000,
         messages=[{
             "role": "user",
             "content": f"""
 Analiza profundamente este contenido.
-Genera un resumen estructurado con:
-
-- Ideas principales
-- Conceptos clave
-- Conexiones importantes
-- Aplicaciones prácticas
-- Conclusión final
+Genera resumen estructurado con ideas principales,
+conceptos clave, conexiones y aplicaciones prácticas.
 
 Contenido:
-{smart_truncate(combined_text, 60000)}
+{smart_truncate(combined_text)}
 """
         }]
     )
     return r.content[0].text
 
-# ── PRESENTACIÓN ─────────────────────────────────────────────────────────
+# ── PRESENTACIÓN JSON ──────────────────────────────
 def generate_presentation_data(combined_text, num_slides):
     r = client.messages.create(
         model="claude-sonnet-4-5-20250929",
@@ -138,17 +120,11 @@ def generate_presentation_data(combined_text, num_slides):
         messages=[{
             "role": "user",
             "content": f"""
-Eres un diseñador experto en presentaciones universitarias.
+Crea una presentación universitaria de {num_slides} diapositivas.
+Máximo 6 bullets por slide.
+Alterna tipos: titulo, concepto, cita, tabla, conclusion.
 
-Crea una presentación profunda y progresiva de {num_slides} diapositivas.
-
-Reglas:
-- Máximo 6 bullets por slide
-- Alterna tipos: titulo, concepto, cita, tabla, conclusion
-- Notas del orador amplían la explicación
-- Contenido sustancial
-
-Devuelve SOLO JSON válido con estructura:
+Devuelve SOLO JSON válido:
 
 {{
 "titulo":"...",
@@ -160,18 +136,55 @@ Devuelve SOLO JSON válido con estructura:
 }}
 
 Contenido:
-{smart_truncate(combined_text, 60000)}
+{smart_truncate(combined_text)}
 """
         }]
     )
+    return safe_json_parse(r.content[0].text)
 
-    raw = r.content[0].text
-    return safe_json_parse(raw)
+# ── CONSTRUIR PPTX CON NODE ───────────────────────
+def build_pptx_file(prs_data):
 
-# ── INTERFAZ ────────────────────────────────────────────────────────────
+    if len(prs_data.get("slides", [])) > 70:
+        raise RuntimeError("Máximo recomendado 70 diapositivas.")
+
+    js_code = f"""
+const pptxgen = require('pptxgenjs');
+let pptx = new pptxgen();
+
+pptx.title = "{prs_data.get('titulo','Presentación')}";
+
+{generate_js_slides(prs_data)}
+
+pptx.writeFile({{ fileName: "output.pptx" }});
+"""
+
+    tmp_js = tempfile.mktemp(suffix=".js")
+    with open(tmp_js, "w", encoding="utf-8") as f:
+        f.write(js_code)
+
+    subprocess.run(["node", tmp_js], timeout=120)
+
+    with open("output.pptx", "rb") as f:
+        data = f.read()
+
+    os.remove(tmp_js)
+    os.remove("output.pptx")
+
+    return data
+
+def generate_js_slides(prs_data):
+    js = ""
+    for slide in prs_data.get("slides", []):
+        js += "let slide = pptx.addSlide();\n"
+        js += f"slide.addText('{slide.get('titulo','')}', {{ x:1, y:0.5, fontSize:24, bold:true }});\n"
+        if "puntos" in slide:
+            content = "\\n".join(slide["puntos"])
+            js += f"slide.addText('{content}', {{ x:1, y:1.5, fontSize:18 }});\n"
+    return js
+
+# ── UI ─────────────────────────────────────────────
 st.title("📚 AI Study Buddy")
-
-st.markdown("### 📥 Cargar fuentes")
 
 uploaded_files = st.file_uploader(
     "Sube archivos",
@@ -191,75 +204,40 @@ if uploaded_files:
 if st.session_state.sources:
     st.metric("Fuentes", len(st.session_state.sources))
 
-st.markdown("### ⚡ Analizar")
-
 if st.button("Analizar contenido", disabled=not bool(st.session_state.sources)):
     combined = build_combined_text()
     st.session_state.combined_text = combined
-
     with st.spinner("Generando resumen..."):
         st.session_state.full_summary = generate_full_summary(combined)
-
     st.session_state.analysis_done = True
     st.success("Análisis completo.")
     st.rerun()
 
-# ── RESULTADOS ───────────────────────────────────────────────────────────
 if st.session_state.analysis_done:
 
-    tab1, tab2, tab3 = st.tabs([
-        "📋 Resumen",
-        "🎯 Presentación PPT",
-        "💬 Chat"
-    ])
+    tab1, tab2 = st.tabs(["📋 Resumen", "🎯 Presentación PPT"])
 
-    # RESUMEN
     with tab1:
         st.markdown(st.session_state.full_summary)
-        st.download_button(
-            "Descargar resumen",
-            st.session_state.full_summary,
-            "resumen.md"
-        )
 
-    # PPT
     with tab2:
-        num_slides = st.slider(
-            "Número de diapositivas",
-            min_value=8,
-            max_value=60,
-            value=20
-        )
+        num_slides = st.slider("Número de diapositivas", 8, 60, 20)
 
         if st.button("Generar PPT"):
-            with st.spinner("Claude diseñando presentación..."):
+            with st.spinner("Claude generando estructura..."):
                 prs_data = generate_presentation_data(
                     st.session_state.combined_text,
                     num_slides
                 )
 
-            st.success(f"{len(prs_data['slides'])} diapositivas creadas.")
-            st.json(prs_data)
+            with st.spinner("Construyendo archivo .pptx..."):
+                pptx_bytes = build_pptx_file(prs_data)
 
-    # CHAT
-    with tab3:
-        question = st.text_input("Pregunta sobre el contenido")
+            st.success("Presentación lista.")
 
-        if st.button("Enviar") and question:
-            response = client.messages.create(
-                model="claude-sonnet-4-5-20250929",
-                max_tokens=2000,
-                messages=[{
-                    "role": "user",
-                    "content": f"""
-Responde usando exclusivamente este contenido:
-
-{smart_truncate(st.session_state.combined_text, 60000)}
-
-Pregunta:
-{question}
-"""
-                }]
+            st.download_button(
+                label="⬇️ Descargar presentación",
+                data=pptx_bytes,
+                file_name="presentacion.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
             )
-
-            st.markdown(response.content[0].text)
