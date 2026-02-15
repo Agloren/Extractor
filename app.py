@@ -4,21 +4,27 @@ from anthropic import Anthropic
 import json
 import re
 import io
-import subprocess
-import tempfile
-import os
+from pptx import Presentation
+from pptx.util import Pt
+from pptx.dml.color import RGBColor
 
-# ── CONFIG ─────────────────────────────────────────
+# ─────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────
 st.set_page_config(page_title="AI Study Buddy", page_icon="📚", layout="wide")
 
-# ── API CLIENT ─────────────────────────────────────
+# ─────────────────────────────────────────
+# API
+# ─────────────────────────────────────────
 if "ANTHROPIC_API_KEY" in st.secrets:
     client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 else:
     st.error("⚠️ No se encontró ANTHROPIC_API_KEY en secrets.")
     st.stop()
 
-# ── SESSION STATE ──────────────────────────────────
+# ─────────────────────────────────────────
+# SESSION STATE
+# ─────────────────────────────────────────
 for key, default in {
     "sources": [],
     "combined_text": "",
@@ -29,7 +35,9 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── UTILIDADES ─────────────────────────────────────
+# ─────────────────────────────────────────
+# UTILIDADES
+# ─────────────────────────────────────────
 def smart_truncate(text, max_chars=60000):
     if len(text) <= max_chars:
         return text
@@ -42,21 +50,31 @@ def safe_json_parse(raw):
         raw = re.sub(r"```json|```", "", raw).strip()
         return json.loads(raw)
 
-# ── EXTRACTORES ────────────────────────────────────
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip("#")
+    return RGBColor(
+        int(hex_color[0:2], 16),
+        int(hex_color[2:4], 16),
+        int(hex_color[4:6], 16)
+    )
+
+# ─────────────────────────────────────────
+# EXTRACTORES
+# ─────────────────────────────────────────
 def extract_pdf(file_bytes, name):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     text = "".join([p.get_text() for p in doc if p.get_text().strip()])
-    return {"name": name, "type": "PDF", "text": text, "pages": len(doc), "icon": "📄"}
+    return {"name": name, "type": "PDF", "text": text}
 
 def extract_docx(file_bytes, name):
     import docx
     doc = docx.Document(io.BytesIO(file_bytes))
     text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-    return {"name": name, "type": "Word", "text": text, "pages": max(1, len(text)//2000), "icon": "📝"}
+    return {"name": name, "type": "Word", "text": text}
 
 def extract_txt(file_bytes, name):
     text = file_bytes.decode("utf-8", errors="ignore")
-    return {"name": name, "type": "Texto", "text": text, "pages": max(1, len(text)//2000), "icon": "📃"}
+    return {"name": name, "type": "Texto", "text": text}
 
 def extract_pptx(file_bytes, name):
     from pptx import Presentation
@@ -67,7 +85,7 @@ def extract_pptx(file_bytes, name):
         if parts:
             slides.append(f"[Diapositiva {i+1}]\n" + "\n".join(parts))
     text = "\n\n".join(slides)
-    return {"name": name, "type": "PowerPoint", "text": text, "pages": len(prs.slides), "icon": "📊"}
+    return {"name": name, "type": "PowerPoint", "text": text}
 
 def process_file(uploaded_file):
     name = uploaded_file.name
@@ -86,14 +104,18 @@ def process_file(uploaded_file):
         st.warning(f"Formato .{ext} no soportado.")
         return None
 
-# ── BUILD TEXT ─────────────────────────────────────
+# ─────────────────────────────────────────
+# BUILD TEXT
+# ─────────────────────────────────────────
 def build_combined_text():
     return "\n\n".join([
-        f"\n{'='*60}\n📁 FUENTE: {s['name']} ({s['type']})\n{'='*60}\n{s['text']}"
+        f"\n{'='*50}\nFUENTE: {s['name']} ({s['type']})\n{'='*50}\n{s['text']}"
         for s in st.session_state.sources
     ])
 
-# ── RESUMEN ────────────────────────────────────────
+# ─────────────────────────────────────────
+# RESUMEN
+# ─────────────────────────────────────────
 def generate_full_summary(combined_text):
     r = client.messages.create(
         model="claude-sonnet-4-5-20250929",
@@ -102,8 +124,11 @@ def generate_full_summary(combined_text):
             "role": "user",
             "content": f"""
 Analiza profundamente este contenido.
-Genera resumen estructurado con ideas principales,
-conceptos clave, conexiones y aplicaciones prácticas.
+Genera un resumen estructurado con:
+- Ideas principales
+- Conceptos clave
+- Conexiones
+- Aplicaciones prácticas
 
 Contenido:
 {smart_truncate(combined_text)}
@@ -112,7 +137,9 @@ Contenido:
     )
     return r.content[0].text
 
-# ── PRESENTACIÓN JSON ──────────────────────────────
+# ─────────────────────────────────────────
+# PRESENTACIÓN JSON
+# ─────────────────────────────────────────
 def generate_presentation_data(combined_text, num_slides):
     r = client.messages.create(
         model="claude-sonnet-4-5-20250929",
@@ -122,17 +149,19 @@ def generate_presentation_data(combined_text, num_slides):
             "content": f"""
 Crea una presentación universitaria de {num_slides} diapositivas.
 Máximo 6 bullets por slide.
-Alterna tipos: titulo, concepto, cita, tabla, conclusion.
 
 Devuelve SOLO JSON válido:
 
 {{
 "titulo":"...",
-"autor":"AI Study Buddy",
 "color_primario":"1E2761",
-"color_secundario":"CADCFC",
 "color_acento":"F96167",
-"slides":[ ... ]
+"slides":[
+    {{
+      "titulo":"...",
+      "puntos":["...","..."]
+    }}
+]
 }}
 
 Contenido:
@@ -142,48 +171,86 @@ Contenido:
     )
     return safe_json_parse(r.content[0].text)
 
-# ── CONSTRUIR PPTX CON NODE ───────────────────────
+# ─────────────────────────────────────────
+# GENERAR PPTX
+# ─────────────────────────────────────────
 def build_pptx_file(prs_data):
 
-    if len(prs_data.get("slides", [])) > 70:
-        raise RuntimeError("Máximo recomendado 70 diapositivas.")
+    prs = Presentation()
 
-    js_code = f"""
-const pptxgen = require('pptxgenjs');
-let pptx = new pptxgen();
+    primary = hex_to_rgb(prs_data.get("color_primario", "1E2761"))
+    accent = hex_to_rgb(prs_data.get("color_acento", "F96167"))
 
-pptx.title = "{prs_data.get('titulo','Presentación')}";
+    for slide_data in prs_data.get("slides", []):
+        slide_layout = prs.slide_layouts[1]
+        slide = prs.slides.add_slide(slide_layout)
 
-{generate_js_slides(prs_data)}
+        title = slide.shapes.title
+        title.text = slide_data.get("titulo", "")
 
-pptx.writeFile({{ fileName: "output.pptx" }});
+        for paragraph in title.text_frame.paragraphs:
+            paragraph.font.size = Pt(28)
+            paragraph.font.bold = True
+            paragraph.font.color.rgb = primary
+
+        content = slide.placeholders[1]
+        tf = content.text_frame
+        tf.clear()
+
+        for i, point in enumerate(slide_data.get("puntos", [])):
+            if i == 0:
+                tf.text = point
+            else:
+                p = tf.add_paragraph()
+                p.text = point
+                p.level = 1
+
+        for paragraph in tf.paragraphs:
+            paragraph.font.size = Pt(18)
+            paragraph.font.color.rgb = accent
+
+    pptx_io = io.BytesIO()
+    prs.save(pptx_io)
+    pptx_io.seek(0)
+    return pptx_io.read()
+
+# ─────────────────────────────────────────
+# CHAT
+# ─────────────────────────────────────────
+def chat_with_context(user_message):
+
+    context = smart_truncate(st.session_state.combined_text, 40000)
+
+    messages = [
+        {
+            "role": "user",
+            "content": f"""
+Eres un asistente académico.
+Responde SOLO usando el contenido proporcionado.
+Si algo no aparece, dilo claramente.
+
+CONTENIDO:
+{context}
 """
+        }
+    ]
 
-    tmp_js = tempfile.mktemp(suffix=".js")
-    with open(tmp_js, "w", encoding="utf-8") as f:
-        f.write(js_code)
+    for msg in st.session_state.chat_history:
+        messages.append(msg)
 
-    subprocess.run(["node", tmp_js], timeout=120)
+    messages.append({"role": "user", "content": user_message})
 
-    with open("output.pptx", "rb") as f:
-        data = f.read()
+    response = client.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=1500,
+        messages=messages
+    )
 
-    os.remove(tmp_js)
-    os.remove("output.pptx")
+    return response.content[0].text
 
-    return data
-
-def generate_js_slides(prs_data):
-    js = ""
-    for slide in prs_data.get("slides", []):
-        js += "let slide = pptx.addSlide();\n"
-        js += f"slide.addText('{slide.get('titulo','')}', {{ x:1, y:0.5, fontSize:24, bold:true }});\n"
-        if "puntos" in slide:
-            content = "\\n".join(slide["puntos"])
-            js += f"slide.addText('{content}', {{ x:1, y:1.5, fontSize:18 }});\n"
-    return js
-
-# ── UI ─────────────────────────────────────────────
+# ─────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────
 st.title("📚 AI Study Buddy")
 
 uploaded_files = st.file_uploader(
@@ -202,20 +269,22 @@ if uploaded_files:
         st.rerun()
 
 if st.session_state.sources:
-    st.metric("Fuentes", len(st.session_state.sources))
+    st.metric("Fuentes cargadas", len(st.session_state.sources))
 
 if st.button("Analizar contenido", disabled=not bool(st.session_state.sources)):
     combined = build_combined_text()
     st.session_state.combined_text = combined
+
     with st.spinner("Generando resumen..."):
         st.session_state.full_summary = generate_full_summary(combined)
+
     st.session_state.analysis_done = True
     st.success("Análisis completo.")
     st.rerun()
 
 if st.session_state.analysis_done:
 
-    tab1, tab2 = st.tabs(["📋 Resumen", "🎯 Presentación PPT"])
+    tab1, tab2, tab3 = st.tabs(["📋 Resumen", "🎯 Presentación PPT", "💬 Chat"])
 
     with tab1:
         st.markdown(st.session_state.full_summary)
@@ -224,16 +293,14 @@ if st.session_state.analysis_done:
         num_slides = st.slider("Número de diapositivas", 8, 60, 20)
 
         if st.button("Generar PPT"):
-            with st.spinner("Claude generando estructura..."):
+            with st.spinner("Generando estructura..."):
                 prs_data = generate_presentation_data(
                     st.session_state.combined_text,
                     num_slides
                 )
 
-            with st.spinner("Construyendo archivo .pptx..."):
+            with st.spinner("Construyendo PowerPoint..."):
                 pptx_bytes = build_pptx_file(prs_data)
-
-            st.success("Presentación lista.")
 
             st.download_button(
                 label="⬇️ Descargar presentación",
@@ -241,3 +308,32 @@ if st.session_state.analysis_done:
                 file_name="presentacion.pptx",
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
             )
+
+    with tab3:
+
+        for msg in st.session_state.chat_history:
+            if msg["role"] == "user":
+                st.chat_message("user").write(msg["content"])
+            else:
+                st.chat_message("assistant").write(msg["content"])
+
+        user_input = st.chat_input("Haz una pregunta sobre el contenido...")
+
+        if user_input:
+
+            st.chat_message("user").write(user_input)
+
+            st.session_state.chat_history.append({
+                "role": "user",
+                "content": user_input
+            })
+
+            with st.spinner("Pensando..."):
+                answer = chat_with_context(user_input)
+
+            st.chat_message("assistant").write(answer)
+
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": answer
+            })
