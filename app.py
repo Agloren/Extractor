@@ -525,11 +525,24 @@ if st.session_state.analysis_done:
                         st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
                         st.rerun()
 
-        pregunta = st.chat_input("Escribe tu pregunta sobre el contenido...")
-        if pregunta:
-            st.session_state.chat_history.append({"role": "user", "content": pregunta})
+        st.markdown("")
+        col_input, col_send = st.columns([5, 1])
+        with col_input:
+            pregunta = st.text_area(
+                "Tu pregunta:",
+                key="chat_input_text",
+                height=80,
+                placeholder="Escribe tu pregunta sobre el contenido...",
+                label_visibility="collapsed"
+            )
+        with col_send:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            enviar = st.button("📨 Enviar", use_container_width=True, type="primary")
+
+        if enviar and pregunta and pregunta.strip():
+            st.session_state.chat_history.append({"role": "user", "content": pregunta.strip()})
             with st.spinner("Claude está pensando..."):
-                respuesta = ask_question(pregunta, st.session_state.chat_history[:-1])
+                respuesta = ask_question(pregunta.strip(), st.session_state.chat_history[:-1])
             st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
             st.rerun()
 
