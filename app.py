@@ -526,18 +526,14 @@ if st.session_state.analysis_done:
                         st.rerun()
 
         st.markdown("")
-        col_input, col_send = st.columns([5, 1])
-        with col_input:
+        with st.form(key="chat_form", clear_on_submit=True):
             pregunta = st.text_area(
                 "Tu pregunta:",
-                key="chat_input_text",
                 height=80,
                 placeholder="Escribe tu pregunta sobre el contenido...",
                 label_visibility="collapsed"
             )
-        with col_send:
-            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-            enviar = st.button("📨 Enviar", use_container_width=True, type="primary")
+            enviar = st.form_submit_button("📨 Enviar pregunta", use_container_width=True, type="primary")
 
         if enviar and pregunta and pregunta.strip():
             st.session_state.chat_history.append({"role": "user", "content": pregunta.strip()})
