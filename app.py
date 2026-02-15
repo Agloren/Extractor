@@ -3,35 +3,42 @@ import fitz  # PyMuPDF
 from anthropic import Anthropic
 import json
 import re
+import base64
+import io
 
 # ── CONFIGURACIÓN ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI Study Buddy", page_icon="📚", layout="wide")
 
 st.markdown("""
 <style>
-.chapter-card {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-    border-radius: 12px; padding: 20px; color: white;
-    margin: 10px 0; border-left: 4px solid #e94560;
+.source-card {
+    background: #f8f9fa; border-radius: 10px; padding: 12px 16px;
+    margin: 6px 0; border-left: 4px solid #667eea;
+    display: flex; align-items: center; justify-content: space-between;
 }
-.chapter-title { font-size: 18px; font-weight: bold; color: #e94560; margin-bottom: 8px; }
-.metric-box {
-    background: #f8f9fa; border-radius: 10px;
-    padding: 15px; text-align: center; border: 1px solid #dee2e6;
-}
+.source-name { font-weight: bold; font-size: 14px; color: #333; }
+.source-meta { font-size: 12px; color: #888; }
 .chat-user {
     background: #e3f2fd; border-radius: 12px 12px 2px 12px;
-    padding: 12px 16px; margin: 8px 0; margin-left: 20%;
+    padding: 12px 16px; margin: 8px 0; margin-left: 15%;
     border: 1px solid #90caf9;
 }
 .chat-claude {
     background: #f3e5f5; border-radius: 12px 12px 12px 2px;
-    padding: 12px 16px; margin: 8px 0; margin-right: 20%;
+    padding: 12px 16px; margin: 8px 0; margin-right: 15%;
     border: 1px solid #ce93d8;
 }
 .chat-label-user { font-size: 11px; color: #1565c0; font-weight: bold; margin-bottom: 4px; }
 .chat-label-claude { font-size: 11px; color: #6a1b9a; font-weight: bold; margin-bottom: 4px; }
+.format-pill {
+    display: inline-block; background: #667eea; color: white;
+    border-radius: 20px; padding: 2px 10px; font-size: 11px; margin: 2px;
+}
 .stButton > button { border-radius: 10px; font-weight: bold; }
+.big-header {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border-radius: 16px; padding: 24px; color: white; margin-bottom: 20px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -43,56 +50,126 @@ else:
     st.stop()
 
 # ── ESTADO DE SESIÓN ───────────────────────────────────────────────────────────
-defaults = {
-    "pdf_text": "",
-    "num_pages": 0,
-    "filename": "",
-    "chapters": [],
-    "chapter_summaries": {},
-    "full_summary": "",
-    "analysis_done": False,
-    "chat_history": [],
-    "active_tab": 0,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+if "sources" not in st.session_state:
+    st.session_state.sources = []          # Lista de {name, type, text, pages}
+if "combined_text" not in st.session_state:
+    st.session_state.combined_text = ""
+if "chapters" not in st.session_state:
+    st.session_state.chapters = []
+if "chapter_summaries" not in st.session_state:
+    st.session_state.chapter_summaries = {}
+if "full_summary" not in st.session_state:
+    st.session_state.full_summary = ""
+if "analysis_done" not in st.session_state:
+    st.session_state.analysis_done = False
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "doc_info" not in st.session_state:
+    st.session_state.doc_info = {}
 
-# ── EXTRACCIÓN DE TEXTO ────────────────────────────────────────────────────────
-def extract_text(pdf_file):
-    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
-    pages_text = []
-    for i, page in enumerate(doc):
+# ── EXTRACTORES POR FORMATO ────────────────────────────────────────────────────
+
+def extract_pdf(file_bytes, name):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pages, text = len(doc), ""
+    for page in doc:
         t = page.get_text()
         if t.strip():
-            pages_text.append({"page": i + 1, "text": t})
-    return pages_text, len(doc)
+            text += t + "\n\n"
+    return {"name": name, "type": "PDF", "text": text, "pages": pages, "icon": "📄"}
 
-def pages_to_full_text(pages_text):
-    return "\n\n".join([f"[Página {p['page']}]\n{p['text']}" for p in pages_text])
+def extract_docx(file_bytes, name):
+    import docx
+    doc = docx.Document(io.BytesIO(file_bytes))
+    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+    pages = max(1, len(text) // 2000)
+    return {"name": name, "type": "Word", "text": text, "pages": pages, "icon": "📝"}
 
-# ── DETECCIÓN DE CAPÍTULOS ─────────────────────────────────────────────────────
-def detect_chapters(full_text, num_pages):
-    """Usa Claude para detectar capítulos o secciones del documento."""
-    sample = full_text[:20000]
-    prompt = f"""Analiza este documento y detecta sus capítulos o secciones principales.
+def extract_txt(file_bytes, name):
+    text = file_bytes.decode("utf-8", errors="ignore")
+    pages = max(1, len(text) // 2000)
+    return {"name": name, "type": "Texto", "text": text, "pages": pages, "icon": "📃"}
 
-Texto (primeras páginas):
+def extract_pptx(file_bytes, name):
+    from pptx import Presentation
+    prs = Presentation(io.BytesIO(file_bytes))
+    slides_text = []
+    for i, slide in enumerate(prs.slides):
+        slide_content = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                slide_content.append(shape.text.strip())
+        if slide_content:
+            slides_text.append(f"[Diapositiva {i+1}]\n" + "\n".join(slide_content))
+    text = "\n\n".join(slides_text)
+    return {"name": name, "type": "PowerPoint", "text": text, "pages": len(prs.slides), "icon": "📊"}
+
+def extract_audio(file_bytes, mime_type, name):
+    """Transcribe audio enviándolo a Claude."""
+    b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+    with st.spinner(f"🎙️ Transcribiendo {name}..."):
+        r = client.messages.create(
+            model="claude-sonnet-4-5-20250929", max_tokens=4000,
+            messages=[{"role": "user", "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
+                {"type": "text", "text": "Transcribe este audio de forma completa y fiel. Devuelve solo la transcripción."}
+            ]}]
+        )
+    text = r.content[0].text
+    duration_est = max(1, len(text) // 800)
+    return {"name": name, "type": "Audio", "text": text, "pages": duration_est, "icon": "🎙️"}
+
+def process_file(uploaded_file):
+    """Detecta el tipo y extrae el texto del archivo."""
+    name = uploaded_file.name
+    ext = name.split(".")[-1].lower()
+    file_bytes = uploaded_file.read()
+
+    if ext == "pdf":
+        return extract_pdf(file_bytes, name)
+    elif ext == "docx":
+        return extract_docx(file_bytes, name)
+    elif ext in ["txt", "md"]:
+        return extract_txt(file_bytes, name)
+    elif ext == "pptx":
+        return extract_pptx(file_bytes, name)
+    elif ext in ["mp3", "wav", "m4a", "mp4", "webm", "ogg"]:
+        mime_map = {
+            "mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4",
+            "mp4": "audio/mp4", "webm": "audio/webm", "ogg": "audio/ogg"
+        }
+        return extract_audio(file_bytes, mime_map.get(ext, "audio/mpeg"), name)
+    else:
+        st.warning(f"Formato .{ext} no soportado.")
+        return None
+
+# ── ANÁLISIS ───────────────────────────────────────────────────────────────────
+
+def build_combined_text():
+    """Combina el texto de todas las fuentes con separadores claros."""
+    parts = []
+    for src in st.session_state.sources:
+        parts.append(f"\n{'='*60}\n📁 FUENTE: {src['name']} ({src['type']})\n{'='*60}\n{src['text']}")
+    return "\n\n".join(parts)
+
+def detect_chapters(combined_text, total_pages):
+    sample = combined_text[:20000]
+    num_sources = len(st.session_state.sources)
+    prompt = f"""Analiza este contenido y detecta sus capítulos o secciones principales.
+Proviene de {num_sources} fuente(s) distintas con {total_pages} páginas/unidades en total.
+
+Contenido:
 {sample}
 
-El documento tiene {num_pages} páginas en total.
-
-Devuelve ÚNICAMENTE un JSON válido (sin markdown) con esta estructura:
+Devuelve ÚNICAMENTE JSON válido (sin markdown):
 {{
   "titulo_documento": "...",
-  "tipo": "libro|articulo|informe|manual|otro",
+  "tipo": "libro|articulo|informe|presentacion|mixto|otro",
   "capitulos": [
-    {{"numero": 1, "titulo": "...", "pagina_inicio": 1, "pagina_fin": 10, "descripcion_breve": "..."}}
+    {{"numero": 1, "titulo": "...", "pagina_inicio": 1, "pagina_fin": 10, "descripcion_breve": "...", "fuente": "nombre del archivo"}}
   ]
 }}
-
-Si no hay capítulos claros, crea divisiones lógicas por bloques temáticos.
-Máximo 15 capítulos/secciones."""
+Máximo 15 secciones. Si hay varias fuentes, crea una sección por fuente o por tema."""
 
     r = client.messages.create(
         model="claude-sonnet-4-5-20250929", max_tokens=2000,
@@ -101,33 +178,28 @@ Máximo 15 capítulos/secciones."""
     raw = re.sub(r"```json|```", "", r.content[0].text).strip()
     return json.loads(raw)
 
-# ── RESUMEN GENERAL ────────────────────────────────────────────────────────────
-def generate_full_summary(full_text, doc_info, num_pages):
-    """Genera un resumen ejecutivo completo proporcional al tamaño."""
-    if num_pages <= 5:
-        depth = "CONCISO (el documento es muy corto): idea principal, 5 conceptos clave, conclusión."
-        max_tok = 800
-    elif num_pages <= 20:
-        depth = "MODERADO: resumen ejecutivo, 10 conceptos clave, ideas secundarias, conclusiones."
-        max_tok = 1500
-    elif num_pages <= 80:
-        depth = "COMPLETO: resumen extenso, estructura, 15 conceptos, argumentos principales, conexiones entre ideas, conclusiones."
-        max_tok = 2500
+def generate_full_summary(combined_text, doc_info, total_pages):
+    if total_pages <= 5:
+        depth, max_tok = "CONCISO (documento corto): idea principal, 5 conceptos, conclusión.", 800
+    elif total_pages <= 20:
+        depth, max_tok = "MODERADO: resumen ejecutivo, 10 conceptos, ideas secundarias, conclusiones.", 1500
+    elif total_pages <= 80:
+        depth, max_tok = "COMPLETO: resumen extenso, estructura, 15 conceptos, argumentos, conexiones.", 2500
     else:
-        depth = "EXHAUSTIVO: resumen profundo, tesis central del autor, mapa de conceptos (20+), ideas por sección, aplicaciones prácticas, valoración crítica."
-        max_tok = 4000
+        depth, max_tok = "EXHAUSTIVO: resumen profundo, tesis, 20+ conceptos, ideas por sección, aplicaciones.", 4000
 
-    prompt = f"""Analiza este documento y genera un análisis {depth}
+    fuentes_str = ", ".join([f"{s['icon']} {s['name']}" for s in st.session_state.sources])
 
-Título: {doc_info.get('titulo_documento', 'Documento')}
-Tipo: {doc_info.get('tipo', 'documento')}
-Páginas: {num_pages}
+    prompt = f"""Analiza este contenido y genera un análisis {depth}
+
+Título: {doc_info.get('titulo_documento', 'Contenido de estudio')}
+Tipo: {doc_info.get('tipo', 'mixto')}
+Fuentes: {fuentes_str}
 
 Contenido:
-{full_text[:20000]}
+{combined_text[:20000]}
 
-Usa formato Markdown bien estructurado con headers, tablas y listas.
-Sé exhaustivo y útil para el estudio."""
+Usa Markdown estructurado con headers, tablas y listas. Sé exhaustivo."""
 
     r = client.messages.create(
         model="claude-sonnet-4-5-20250929", max_tokens=max_tok,
@@ -135,39 +207,41 @@ Sé exhaustivo y útil para el estudio."""
     )
     return r.content[0].text
 
-# ── RESUMEN POR CAPÍTULO ───────────────────────────────────────────────────────
-def summarize_chapter(chapter, full_text, pages_text):
-    """Genera un análisis detallado de un capítulo específico."""
-    # Extraer texto del capítulo según páginas
-    p_start = chapter.get("pagina_inicio", 1)
-    p_end = chapter.get("pagina_fin", p_start + 5)
-    chapter_pages = [p for p in pages_text if p_start <= p["page"] <= p_end]
-    chapter_text = "\n".join([p["text"] for p in chapter_pages]) if chapter_pages else full_text[:8000]
+def summarize_chapter(chapter, combined_text):
+    fuente = chapter.get("fuente", "")
+    # Buscar texto de la fuente específica si se indica
+    chapter_text = combined_text
+    for src in st.session_state.sources:
+        if fuente and fuente.lower() in src["name"].lower():
+            chapter_text = src["text"]
+            break
 
-    prompt = f"""Analiza en detalle este capítulo/sección del documento.
+    prompt = f"""Analiza en detalle esta sección del contenido.
 
-Capítulo: {chapter.get('titulo', 'Sin título')} (págs. {p_start}-{p_end})
+Sección: {chapter.get('titulo', 'Sin título')}
+Fuente: {fuente or 'general'}
 
 Contenido:
 {chapter_text[:10000]}
 
-Genera un análisis completo en Markdown con:
-## 📋 Resumen del capítulo
-(3-5 frases que capturen la esencia)
+Genera en Markdown:
+
+## 📋 Resumen de la sección
+(3-5 frases esenciales)
 
 ## 🔑 Conceptos clave
 | Concepto | Definición | Importancia |
 |----------|-----------|-------------|
-(5-10 conceptos del capítulo)
+(5-10 filas)
 
 ## 💡 Ideas principales
-(Lista detallada de las ideas más importantes)
+(Lista detallada)
 
-## 🔗 Conexiones
-(Cómo se relaciona con el resto del documento o con conocimiento previo)
+## 🔗 Conexiones con otras secciones
+(Relaciones con el resto del contenido)
 
-## ❓ Preguntas de reflexión
-(3 preguntas para comprobar la comprensión del capítulo)"""
+## ❓ Preguntas de comprensión
+(3-5 preguntas para autoevaluarse)"""
 
     r = client.messages.create(
         model="claude-sonnet-4-5-20250929", max_tokens=2000,
@@ -175,101 +249,184 @@ Genera un análisis completo en Markdown con:
     )
     return r.content[0].text
 
-# ── CHAT SOBRE EL CONTENIDO ────────────────────────────────────────────────────
-def ask_question(question, full_text, chat_history, doc_title):
-    """Responde preguntas sobre el documento manteniendo contexto de conversación."""
-    # Construir historial para la API
+def ask_question(question, chat_history):
+    doc_title = st.session_state.doc_info.get("titulo_documento", "el documento")
+    fuentes_str = "\n".join([f"- {s['icon']} {s['name']} ({s['type']})" for s in st.session_state.sources])
+
     messages = []
-
-    # Añadir historial previo (últimas 6 interacciones para no exceder límite)
-    for msg in chat_history[-6:]:
+    for msg in chat_history[-8:]:
         messages.append({"role": msg["role"], "content": msg["content"]})
-
-    # Añadir pregunta actual
     messages.append({"role": "user", "content": question})
 
     r = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=1500,
-        system=f"""Eres un tutor experto en el documento "{doc_title}".
-Tienes acceso completo al contenido del documento:
+        model="claude-sonnet-4-5-20250929", max_tokens=1500,
+        system=f"""Eres un tutor experto en el siguiente contenido de estudio.
 
+Fuentes disponibles:
+{fuentes_str}
+
+Contenido completo:
 ---
-{full_text[:18000]}
+{st.session_state.combined_text[:18000]}
 ---
 
-Responde preguntas de forma clara, precisa y didáctica.
-Cita siempre de qué parte del documento sacas la información.
-Si la pregunta no está relacionada con el documento, indícalo amablemente.
-Usa formato Markdown cuando sea útil.""",
+Responde con precisión y cita siempre de qué fuente o sección viene la información.
+Si preguntan algo no relacionado con el contenido, indícalo amablemente.
+Usa Markdown cuando sea útil.""",
         messages=messages
     )
     return r.content[0].text
 
 # ── INTERFAZ PRINCIPAL ─────────────────────────────────────────────────────────
-st.title("📚 AI Study Buddy")
-st.markdown("Análisis profundo por capítulos + chat interactivo sobre el contenido.")
-st.markdown("---")
+st.markdown("""
+<div class='big-header'>
+    <h2 style='margin:0'>📚 AI Study Buddy</h2>
+    <p style='margin:4px 0 0 0; opacity:0.85'>
+        Sube PDFs, Word, PowerPoint, TXT, audios o escribe texto.
+        Claude analizará todo junto y podrás hacer preguntas.
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
-# ── CARGA DE PDF ───────────────────────────────────────────────────────────────
-with st.expander("📥 Cargar documento PDF", expanded=not st.session_state.analysis_done):
-    uploaded_file = st.file_uploader("Selecciona tu PDF", type="pdf")
+# Formatos soportados
+st.markdown("""
+<div style='margin-bottom:16px'>
+<span class='format-pill'>📄 PDF</span>
+<span class='format-pill'>📝 Word</span>
+<span class='format-pill'>📊 PowerPoint</span>
+<span class='format-pill'>📃 TXT / MD</span>
+<span class='format-pill'>🎙️ MP3 / WAV / M4A</span>
+<span class='format-pill'>🎬 MP4 / WEBM</span>
+</div>
+""", unsafe_allow_html=True)
 
-    if uploaded_file:
-        if uploaded_file.name != st.session_state.filename:
-            # Nuevo archivo — resetear estado
-            for k, v in defaults.items():
-                st.session_state[k] = v
+# ── PANEL DE CARGA ─────────────────────────────────────────────────────────────
+with st.expander("📥 Gestionar fuentes de contenido", expanded=not st.session_state.analysis_done):
 
-        pages_text, num_pages = extract_text(uploaded_file)
-        full_text = pages_to_full_text(pages_text)
-        st.session_state.pdf_text = full_text
-        st.session_state.num_pages = num_pages
-        st.session_state.filename = uploaded_file.name
-        st.session_state.pages_text = pages_text
+    col_upload, col_text = st.columns([1, 1])
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("📄 Páginas", num_pages)
-        with col2:
-            st.metric("📝 Caracteres", f"{len(full_text):,}")
-        with col3:
-            tipo = "📄 Artículo" if num_pages <= 5 else "📑 Medio" if num_pages <= 20 else "📘 Extenso" if num_pages <= 80 else "📚 Libro"
-            st.metric("📊 Tipo", tipo)
+    with col_upload:
+        st.markdown("**Subir archivos**")
+        uploaded_files = st.file_uploader(
+            "Selecciona uno o varios archivos",
+            type=["pdf", "docx", "txt", "md", "pptx", "mp3", "wav", "m4a", "mp4", "webm", "ogg"],
+            accept_multiple_files=True,
+            help="Puedes subir múltiples archivos de diferentes formatos"
+        )
+        if uploaded_files:
+            if st.button("➕ Añadir archivos a la sesión", use_container_width=True):
+                existing_names = [s["name"] for s in st.session_state.sources]
+                added = 0
+                for f in uploaded_files:
+                    if f.name not in existing_names:
+                        with st.spinner(f"Procesando {f.name}..."):
+                            source = process_file(f)
+                        if source and source["text"].strip():
+                            st.session_state.sources.append(source)
+                            added += 1
+                if added:
+                    st.session_state.analysis_done = False
+                    st.session_state.full_summary = ""
+                    st.session_state.chapters = []
+                    st.session_state.chapter_summaries = {}
+                    st.success(f"✅ {added} fuente(s) añadidas.")
+                    st.rerun()
+
+    with col_text:
+        st.markdown("**Pegar texto directamente**")
+        text_name = st.text_input("Nombre para este texto:", placeholder="Ej: Mis apuntes de clase")
+        text_input = st.text_area("Escribe o pega el texto:", height=150,
+                                  placeholder="Pega aquí tus apuntes, artículos, notas...")
+        if st.button("➕ Añadir texto", use_container_width=True):
+            if text_input.strip() and text_name.strip():
+                existing_names = [s["name"] for s in st.session_state.sources]
+                if text_name not in existing_names:
+                    source = {
+                        "name": text_name,
+                        "type": "Texto",
+                        "text": text_input,
+                        "pages": max(1, len(text_input) // 2000),
+                        "icon": "📃"
+                    }
+                    st.session_state.sources.append(source)
+                    st.session_state.analysis_done = False
+                    st.success(f"✅ Texto '{text_name}' añadido.")
+                    st.rerun()
+            else:
+                st.warning("Escribe un nombre y algún contenido.")
+
+    # Lista de fuentes cargadas
+    if st.session_state.sources:
+        st.markdown("---")
+        st.markdown(f"**📚 Fuentes cargadas ({len(st.session_state.sources)})**")
+
+        total_pages = sum(s["pages"] for s in st.session_state.sources)
+        total_chars = sum(len(s["text"]) for s in st.session_state.sources)
+
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("📁 Fuentes", len(st.session_state.sources))
+        col_m2.metric("📄 Páginas totales", total_pages)
+        col_m3.metric("📝 Caracteres", f"{total_chars:,}")
+
+        for i, src in enumerate(st.session_state.sources):
+            col_s, col_del = st.columns([5, 1])
+            with col_s:
+                st.markdown(
+                    f"<div class='source-card'>"
+                    f"<div><span class='source-name'>{src['icon']} {src['name']}</span>"
+                    f"<span class='source-meta'> · {src['type']} · {src['pages']} págs · {len(src['text']):,} chars</span></div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+            with col_del:
+                if st.button("🗑️", key=f"del_{i}", help="Eliminar esta fuente"):
+                    st.session_state.sources.pop(i)
+                    st.session_state.analysis_done = False
+                    st.rerun()
 
         st.markdown("")
-        if st.button("⚡ Analizar documento completo", use_container_width=True):
-            if not full_text.strip():
-                st.warning("⚠️ No se pudo extraer texto.")
-            else:
-                # 1. Detectar capítulos
-                with st.spinner("🔍 Detectando capítulos y estructura..."):
-                    doc_info = detect_chapters(full_text, num_pages)
+        col_an, col_reset = st.columns([3, 1])
+        with col_an:
+            if st.button("⚡ Analizar todo el contenido", use_container_width=True):
+                combined = build_combined_text()
+                st.session_state.combined_text = combined
+
+                with st.spinner("🔍 Detectando estructura y capítulos..."):
+                    doc_info = detect_chapters(combined, total_pages)
                     st.session_state.chapters = doc_info.get("capitulos", [])
                     st.session_state.doc_info = doc_info
 
-                # 2. Resumen general
                 with st.spinner("📝 Generando resumen general..."):
-                    st.session_state.full_summary = generate_full_summary(
-                        full_text, doc_info, num_pages
-                    )
+                    st.session_state.full_summary = generate_full_summary(combined, doc_info, total_pages)
 
                 st.session_state.analysis_done = True
-                st.success(f"✅ Análisis listo. {len(st.session_state.chapters)} capítulos detectados.")
+                st.session_state.chapter_summaries = {}
+                st.session_state.chat_history = []
+                st.success(f"✅ Análisis listo. {len(st.session_state.chapters)} secciones detectadas.")
                 st.rerun()
 
-# ── CONTENIDO PRINCIPAL ────────────────────────────────────────────────────────
+        with col_reset:
+            if st.button("🔄 Limpiar todo", use_container_width=True):
+                for k in ["sources", "combined_text", "chapters", "chapter_summaries",
+                          "full_summary", "analysis_done", "chat_history", "doc_info"]:
+                    st.session_state[k] = [] if k in ["sources", "chapters", "chat_history"] else \
+                                          {} if k in ["chapter_summaries", "doc_info"] else \
+                                          "" if k in ["combined_text", "full_summary"] else False
+                st.rerun()
+
+# ── CONTENIDO ANALIZADO ────────────────────────────────────────────────────────
 if st.session_state.analysis_done:
-    doc_info = st.session_state.get("doc_info", {})
-    doc_title = doc_info.get("titulo_documento", st.session_state.filename)
+    doc_info = st.session_state.doc_info
+    doc_title = doc_info.get("titulo_documento", "Contenido de estudio")
 
     st.subheader(f"📖 {doc_title}")
-    st.caption(f"{st.session_state.num_pages} páginas · {doc_info.get('tipo', 'documento').capitalize()}")
+    fuentes_icons = " · ".join([f"{s['icon']} {s['name']}" for s in st.session_state.sources])
+    st.caption(fuentes_icons)
     st.markdown("---")
 
-    tab1, tab2, tab3 = st.tabs(["📋 Resumen general", "📑 Capítulos", "💬 Preguntar al libro"])
+    tab1, tab2, tab3 = st.tabs(["📋 Resumen general", "📑 Secciones y capítulos", "💬 Preguntar al contenido"])
 
-    # ── TAB 1: RESUMEN GENERAL ─────────────────────────────────────────────────
+    # ── TAB 1: RESUMEN ─────────────────────────────────────────────────────────
     with tab1:
         st.markdown(st.session_state.full_summary)
         st.download_button(
@@ -284,84 +441,79 @@ if st.session_state.analysis_done:
         chapters = st.session_state.chapters
 
         if not chapters:
-            st.info("No se detectaron capítulos en este documento.")
+            st.info("No se detectaron secciones.")
         else:
-            # Índice de capítulos
-            st.markdown("### 📌 Índice")
+            st.markdown("### 📌 Estructura del contenido")
             for ch in chapters:
-                st.markdown(f"**{ch['numero']}.** {ch['titulo']} *(págs. {ch.get('pagina_inicio','?')}-{ch.get('pagina_fin','?')})*")
+                fuente_badge = f" `{ch.get('fuente', '')}`" if ch.get("fuente") else ""
+                st.markdown(f"**{ch['numero']}.** {ch['titulo']}{fuente_badge}")
                 if ch.get("descripcion_breve"):
                     st.caption(ch["descripcion_breve"])
 
             st.markdown("---")
-            st.markdown("### 🔍 Análisis por capítulo")
+            st.markdown("### 🔍 Análisis por sección")
 
-            # Selector de capítulo
             chapter_names = [f"{ch['numero']}. {ch['titulo']}" for ch in chapters]
-            selected = st.selectbox("Selecciona un capítulo:", chapter_names)
+            selected = st.selectbox("Selecciona una sección:", chapter_names)
             ch_idx = chapter_names.index(selected)
             chapter = chapters[ch_idx]
             ch_key = f"ch_{ch_idx}"
 
-            col_an, col_dl = st.columns([3, 1])
-            with col_an:
+            col_btn, col_dl = st.columns([3, 1])
+            with col_btn:
                 if st.button(f"⚡ Analizar: {chapter['titulo']}", use_container_width=True):
-                    with st.spinner(f"Analizando capítulo {chapter['numero']}..."):
-                        summary = summarize_chapter(
-                            chapter,
-                            st.session_state.pdf_text,
-                            st.session_state.get("pages_text", [])
-                        )
+                    with st.spinner(f"Analizando sección {chapter['numero']}..."):
+                        summary = summarize_chapter(chapter, st.session_state.combined_text)
                         st.session_state.chapter_summaries[ch_key] = summary
-                        st.rerun()
+                    st.rerun()
 
-            # Mostrar análisis si existe
             if ch_key in st.session_state.chapter_summaries:
                 with col_dl:
                     st.download_button(
                         "⬇️ Descargar",
                         st.session_state.chapter_summaries[ch_key],
-                        file_name=f"capitulo_{chapter['numero']}.md",
+                        file_name=f"seccion_{chapter['numero']}.md",
                         mime="text/markdown"
                     )
                 st.markdown(st.session_state.chapter_summaries[ch_key])
 
-                # Capítulos ya analizados
-                analyzed = [k for k in st.session_state.chapter_summaries]
-                if len(analyzed) > 1:
-                    with st.expander(f"📚 Ver otros {len(analyzed)-1} capítulos ya analizados"):
-                        for k in analyzed:
+                analyzed_keys = list(st.session_state.chapter_summaries.keys())
+                if len(analyzed_keys) > 1:
+                    with st.expander(f"📚 Ver otras {len(analyzed_keys)-1} secciones analizadas"):
+                        for k in analyzed_keys:
                             if k != ch_key:
                                 idx = int(k.split("_")[1])
-                                ch_name = chapters[idx]["titulo"]
-                                with st.expander(f"📄 {chapters[idx]['numero']}. {ch_name}"):
+                                with st.expander(f"📄 {chapters[idx]['numero']}. {chapters[idx]['titulo']}"):
                                     st.markdown(st.session_state.chapter_summaries[k])
             else:
-                st.info("👆 Pulsa el botón para analizar este capítulo en detalle.")
+                st.info("👆 Pulsa el botón para analizar esta sección en detalle.")
 
     # ── TAB 3: CHAT ────────────────────────────────────────────────────────────
     with tab3:
-        st.markdown("### 💬 Pregunta lo que quieras sobre el documento")
-        st.caption("Claude tiene acceso al contenido completo y recuerda el contexto de la conversación.")
+        st.markdown("### 💬 Pregunta lo que quieras sobre el contenido")
+        st.caption(f"Claude tiene acceso a todas las fuentes: {fuentes_icons}")
 
-        # Mostrar historial del chat
         for msg in st.session_state.chat_history:
             if msg["role"] == "user":
-                st.markdown(f"<div class='chat-user'><div class='chat-label-user'>👤 Tú</div>{msg['content']}</div>",
-                            unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='chat-user'><div class='chat-label-user'>👤 Tú</div>{msg['content']}</div>",
+                    unsafe_allow_html=True
+                )
             else:
-                st.markdown(f"<div class='chat-claude'><div class='chat-label-claude'>🤖 Claude</div>{msg['content']}</div>",
-                            unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='chat-claude'><div class='chat-label-claude'>🤖 Claude</div>{msg['content']}</div>",
+                    unsafe_allow_html=True
+                )
 
-        # Sugerencias rápidas
         if not st.session_state.chat_history:
             st.markdown("**💡 Preguntas sugeridas:**")
             sugerencias = [
-                "¿Cuál es la idea principal del documento?",
+                "¿Cuál es la idea principal de todo el contenido?",
                 "¿Qué conceptos son los más importantes?",
-                "Explícame el capítulo más complejo",
+                "Compara las ideas de las diferentes fuentes",
                 "¿Qué aplicaciones prácticas tiene este contenido?",
-                "Hazme un test de 5 preguntas"
+                "Hazme un test de 5 preguntas sobre todo",
+                "¿Qué debo repasar más en profundidad?"
             ]
             cols = st.columns(2)
             for i, sug in enumerate(sugerencias):
@@ -369,36 +521,31 @@ if st.session_state.analysis_done:
                     if st.button(sug, key=f"sug_{i}", use_container_width=True):
                         st.session_state.chat_history.append({"role": "user", "content": sug})
                         with st.spinner("Claude está pensando..."):
-                            respuesta = ask_question(
-                                sug,
-                                st.session_state.pdf_text,
-                                st.session_state.chat_history[:-1],
-                                doc_title
-                            )
+                            respuesta = ask_question(sug, st.session_state.chat_history[:-1])
                         st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
                         st.rerun()
 
-        # Input de pregunta libre
-        st.markdown("")
-        pregunta = st.chat_input("Escribe tu pregunta sobre el documento...")
+        pregunta = st.chat_input("Escribe tu pregunta sobre el contenido...")
         if pregunta:
             st.session_state.chat_history.append({"role": "user", "content": pregunta})
             with st.spinner("Claude está pensando..."):
-                respuesta = ask_question(
-                    pregunta,
-                    st.session_state.pdf_text,
-                    st.session_state.chat_history[:-1],
-                    doc_title
-                )
+                respuesta = ask_question(pregunta, st.session_state.chat_history[:-1])
             st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
             st.rerun()
 
-        # Botón limpiar chat
         if st.session_state.chat_history:
-            if st.button("🗑️ Limpiar conversación"):
-                st.session_state.chat_history = []
-                st.rerun()
+            col_dl_chat, col_clear = st.columns([3, 1])
+            with col_dl_chat:
+                chat_md = "\n\n".join([
+                    f"**{'Tú' if m['role']=='user' else 'Claude'}:** {m['content']}"
+                    for m in st.session_state.chat_history
+                ])
+                st.download_button("⬇️ Descargar conversación", chat_md, "conversacion.md", "text/markdown")
+            with col_clear:
+                if st.button("🗑️ Limpiar chat"):
+                    st.session_state.chat_history = []
+                    st.rerun()
 
 # ── PIE DE PÁGINA ──────────────────────────────────────────────────────────────
 st.markdown("---")
-st.caption("📚 AI Study Buddy · Impulsado por Claude · Análisis inteligente de documentos")
+st.caption("📚 AI Study Buddy · Impulsado por Claude · Multi-formato · Multi-fuente")
