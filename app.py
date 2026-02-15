@@ -493,20 +493,35 @@ if st.session_state.analysis_done:
         st.markdown("### 💬 Pregunta lo que quieras sobre el contenido")
         st.caption(f"Claude tiene acceso a todas las fuentes: {fuentes_icons}")
 
-        for msg in st.session_state.chat_history:
-            if msg["role"] == "user":
-                st.markdown(
-                    f"<div class='chat-user'><div class='chat-label-user'>👤 Tú</div>{msg['content']}</div>",
-                    unsafe_allow_html=True
-                )
-            else:
-                st.markdown(
-                    f"<div class='chat-claude'><div class='chat-label-claude'>🤖 Claude</div>{msg['content']}</div>",
-                    unsafe_allow_html=True
-                )
+        # ── INPUT SIEMPRE VISIBLE ARRIBA ──
+        pregunta_input = st.text_input(
+            "Tu pregunta:",
+            key="pregunta_input",
+            placeholder="Ej: ¿Cuál es la idea principal? ¿Explícame el capítulo 2...",
+        )
+        col_env, col_clear2 = st.columns([3, 1])
+        with col_env:
+            enviar = st.button("📨 Enviar pregunta", key="btn_enviar",
+                               use_container_width=True, type="primary",
+                               disabled=not bool(pregunta_input and pregunta_input.strip()))
+        with col_clear2:
+            if st.button("🗑️ Limpiar chat", key="btn_clear", use_container_width=True):
+                st.session_state.chat_history = []
+                st.rerun()
 
+        if enviar and pregunta_input and pregunta_input.strip():
+            texto_pregunta = pregunta_input.strip()
+            st.session_state.chat_history.append({"role": "user", "content": texto_pregunta})
+            with st.spinner("Claude está pensando..."):
+                respuesta = ask_question(texto_pregunta, st.session_state.chat_history[:-1])
+            st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
+            st.rerun()
+
+        st.markdown("---")
+
+        # ── SUGERENCIAS (solo si no hay historial) ──
         if not st.session_state.chat_history:
-            st.markdown("**💡 Preguntas sugeridas:**")
+            st.markdown("**💡 Preguntas sugeridas para empezar:**")
             sugerencias = [
                 "¿Cuál es la idea principal de todo el contenido?",
                 "¿Qué conceptos son los más importantes?",
@@ -525,35 +540,26 @@ if st.session_state.analysis_done:
                         st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
                         st.rerun()
 
-        st.markdown("")
-        with st.form(key="chat_form", clear_on_submit=True):
-            pregunta = st.text_area(
-                "Tu pregunta:",
-                height=80,
-                placeholder="Escribe tu pregunta sobre el contenido...",
-                label_visibility="collapsed"
-            )
-            enviar = st.form_submit_button("📨 Enviar pregunta", use_container_width=True, type="primary")
+        # ── HISTORIAL ──
+        for msg in st.session_state.chat_history:
+            if msg["role"] == "user":
+                st.markdown(
+                    f"<div class='chat-user'><div class='chat-label-user'>👤 Tú</div>{msg['content']}</div>",
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    f"<div class='chat-claude'><div class='chat-label-claude'>🤖 Claude</div>{msg['content']}</div>",
+                    unsafe_allow_html=True
+                )
 
-        if enviar and pregunta and pregunta.strip():
-            st.session_state.chat_history.append({"role": "user", "content": pregunta.strip()})
-            with st.spinner("Claude está pensando..."):
-                respuesta = ask_question(pregunta.strip(), st.session_state.chat_history[:-1])
-            st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
-            st.rerun()
-
+        # ── DESCARGAR CONVERSACIÓN ──
         if st.session_state.chat_history:
-            col_dl_chat, col_clear = st.columns([3, 1])
-            with col_dl_chat:
-                chat_md = "\n\n".join([
-                    f"**{'Tú' if m['role']=='user' else 'Claude'}:** {m['content']}"
-                    for m in st.session_state.chat_history
-                ])
-                st.download_button("⬇️ Descargar conversación", chat_md, "conversacion.md", "text/markdown")
-            with col_clear:
-                if st.button("🗑️ Limpiar chat"):
-                    st.session_state.chat_history = []
-                    st.rerun()
+            chat_md = "\n\n".join([
+                f"**{'Tú' if m['role']=='user' else 'Claude'}:** {m['content']}"
+                for m in st.session_state.chat_history
+            ])
+            st.download_button("⬇️ Descargar conversación", chat_md, "conversacion.md", "text/markdown")
 
 # ── PIE DE PÁGINA ──────────────────────────────────────────────────────────────
 st.markdown("---")
