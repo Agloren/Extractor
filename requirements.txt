@@ -3,3 +3,4 @@ anthropic
 pymupdf
 python-docx
 python-pptx
+moviepy
