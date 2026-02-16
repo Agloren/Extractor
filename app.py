@@ -1,68 +1,75 @@
 import streamlit as st
-import fitz
+import anthropic
+import os
 import io
-import json
-import re
 import tempfile
-from anthropic import Anthropic
+import pandas as pd
+from PyPDF2 import PdfReader
+from docx import Document
 from pptx import Presentation
-from pptx.util import Pt
-from pptx.dml.color import RGBColor
+from pptx.util import Inches, Pt
 from moviepy import VideoFileClip
+import pypandoc
 
-# ─────────────────────────────────────
+# ─────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────
-st.set_page_config(page_title="AI Study Buddy", layout="wide")
+# ─────────────────────────────────────────
+st.set_page_config(page_title="AI Study Assistant", layout="wide")
 
-if "ANTHROPIC_API_KEY" not in st.secrets:
-    st.error("Falta ANTHROPIC_API_KEY en secrets.")
-    st.stop()
+client = anthropic.Anthropic(
+    api_key=st.secrets["ANTHROPIC_API_KEY"]
+)
 
-client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-
-# ─────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────
-def hex_to_rgb(hex_color):
-    hex_color = hex_color.lstrip("#")
-    return RGBColor(
-        int(hex_color[0:2], 16),
-        int(hex_color[2:4], 16),
-        int(hex_color[4:6], 16)
-    )
-
-def smart_truncate(text, max_chars=15000):
-    return text[:max_chars]
-
-def safe_json_parse(text):
-    text = re.sub(r"```json|```", "", text).strip()
-    return json.loads(text)
-
-# ─────────────────────────────────────
-# EXTRACTORES
-# ─────────────────────────────────────
+# ─────────────────────────────────────────
+# TEXT EXTRACTORS
+# ─────────────────────────────────────────
 def extract_pdf(file_bytes):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    return "\n".join([p.get_text() for p in doc])
+    reader = PdfReader(io.BytesIO(file_bytes))
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 def extract_docx(file_bytes):
-    import docx
-    doc = docx.Document(io.BytesIO(file_bytes))
-    return "\n".join([p.text for p in doc.paragraphs])
+    doc = Document(io.BytesIO(file_bytes))
+    return "\n".join(p.text for p in doc.paragraphs)
 
 def extract_txt(file_bytes):
     return file_bytes.decode("utf-8", errors="ignore")
 
+def extract_rtf(file_bytes):
+    text = file_bytes.decode("utf-8", errors="ignore")
+    return pypandoc.convert_text(text, "plain", format="rtf", extra_args=["--standalone"])
+
+def extract_odt(file_bytes):
+    from odf.opendocument import load
+    from odf import text as odf_text
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".odt") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    doc = load(tmp_path)
+    paragraphs = doc.getElementsByType(odf_text.P)
+    return "\n".join([p.firstChild.data if p.firstChild else "" for p in paragraphs])
+
 def extract_pptx(file_bytes):
     prs = Presentation(io.BytesIO(file_bytes))
-    text = []
+    text = ""
     for slide in prs.slides:
         for shape in slide.shapes:
             if hasattr(shape, "text"):
-                text.append(shape.text)
-    return "\n".join(text)
+                text += shape.text + "\n"
+    return text
 
+def extract_csv(file_bytes):
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    return df.to_string()
+
+def extract_xlsx(file_bytes):
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    return df.to_string()
+
+# ─────────────────────────────────────────
+# AUDIO / VIDEO
+# ─────────────────────────────────────────
 def transcribe_audio(file_bytes, filename):
     response = client.messages.create(
         model="claude-sonnet-4-5-20250929",
@@ -80,19 +87,23 @@ def transcribe_audio(file_bytes, filename):
     return response.content[0].text
 
 def extract_audio_from_video(file_bytes):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    clip = VideoFileClip(tmp_path)
-    audio_path = tmp_path.replace(".mp4", ".mp3")
-    clip.audio.write_audiofile(audio_path)
-    clip.close()
-    with open(audio_path, "rb") as f:
-        return f.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+        tmp_video.write(file_bytes)
+        tmp_video_path = tmp_video.name
 
-# ─────────────────────────────────────
-# PROCESAR ARCHIVO
-# ─────────────────────────────────────
+    clip = VideoFileClip(tmp_video_path)
+    tmp_audio_path = tmp_video_path.replace(".mp4", ".mp3")
+    clip.audio.write_audiofile(tmp_audio_path)
+
+    with open(tmp_audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    clip.close()
+    return audio_bytes
+
+# ─────────────────────────────────────────
+# FILE PROCESSOR
+# ─────────────────────────────────────────
 def process_file(uploaded_file):
     name = uploaded_file.name
     ext = name.split(".")[-1].lower()
@@ -101,181 +112,157 @@ def process_file(uploaded_file):
     if ext == "pdf":
         return extract_pdf(file_bytes)
 
-    if ext == "docx":
+    if ext in ["docx", "doc"]:
         return extract_docx(file_bytes)
 
     if ext in ["txt", "md"]:
         return extract_txt(file_bytes)
 
+    if ext == "rtf":
+        return extract_rtf(file_bytes)
+
+    if ext == "odt":
+        return extract_odt(file_bytes)
+
     if ext == "pptx":
         return extract_pptx(file_bytes)
 
-    if ext in ["mp3","wav","m4a"]:
+    if ext == "csv":
+        return extract_csv(file_bytes)
+
+    if ext == "xlsx":
+        return extract_xlsx(file_bytes)
+
+    if ext in ["mp3", "wav", "m4a", "ogg"]:
         return transcribe_audio(file_bytes, name)
 
-    if ext in ["mp4","mov"]:
+    if ext in ["mp4", "mov", "webm"]:
         audio_bytes = extract_audio_from_video(file_bytes)
         return transcribe_audio(audio_bytes, name)
 
     return ""
 
-# ─────────────────────────────────────
-# GENERAR RESUMEN
-# ─────────────────────────────────────
-def generate_summary(text):
-    r = client.messages.create(
+# ─────────────────────────────────────────
+# AI FUNCTIONS
+# ─────────────────────────────────────────
+def summarize_text(text):
+    response = client.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=2000,
+        messages=[{
+            "role": "user",
+            "content": f"Resume este contenido de forma estructurada y clara:\n\n{text}"
+        }]
+    )
+    return response.content[0].text
+
+def generate_presentation_content(text):
+    response = client.messages.create(
         model="claude-sonnet-4-5-20250929",
         max_tokens=3000,
         messages=[{
             "role": "user",
-            "content": f"Resume profesionalmente:\n{smart_truncate(text)}"
-        }]
-    )
-    return r.content[0].text
-
-# ─────────────────────────────────────
-# CHAT
-# ─────────────────────────────────────
-def ask_question(question, context):
-    r = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=2000,
-        system=f"Eres tutor experto. Contexto:\n{smart_truncate(context)}",
-        messages=[{"role": "user", "content": question}]
-    )
-    return r.content[0].text
-
-# ─────────────────────────────────────
-# PRESENTACIÓN PRO
-# ─────────────────────────────────────
-def generate_presentation_data(text, num_slides):
-    r = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=min(9000, 600*num_slides),
-        messages=[{
-            "role": "user",
             "content": f"""
-Crea una presentación profesional de {num_slides} diapositivas.
-Máximo 5 bullets por slide.
-Devuelve JSON:
+Crea una presentación profesional.
+Formato:
 
-{{
-"titulo_general":"...",
-"subtitulo":"...",
-"color_primario":"1E2761",
-"color_acento":"F96167",
-"slides":[
-  {{
-    "titulo":"...",
-    "contenido":["...","..."],
-    "notas":"..."
-  }}
-]
-}}
+SLIDE: Título
+- Punto
+- Punto
+- Punto
 
 Contenido:
-{smart_truncate(text)}
+{text}
 """
         }]
     )
-    return safe_json_parse(r.content[0].text)
+    return response.content[0].text
 
-def build_pptx(prs_data):
+# ─────────────────────────────────────────
+# BUILD PPT
+# ─────────────────────────────────────────
+def build_ppt(content):
     prs = Presentation()
 
-    primary = hex_to_rgb(prs_data.get("color_primario","1E2761"))
-    accent = hex_to_rgb(prs_data.get("color_acento","F96167"))
+    slides_raw = content.split("SLIDE:")
+    for slide_block in slides_raw:
+        if slide_block.strip() == "":
+            continue
 
-    # PORTADA
-    slide_layout = prs.slide_layouts[0]
-    slide = prs.slides.add_slide(slide_layout)
-    slide.shapes.title.text = prs_data.get("titulo_general","")
-    slide.placeholders[1].text = prs_data.get("subtitulo","")
+        lines = slide_block.strip().split("\n")
+        title = lines[0]
+        bullets = lines[1:]
 
-    # CONTENIDO
-    for slide_data in prs_data.get("slides",[]):
         slide_layout = prs.slide_layouts[1]
         slide = prs.slides.add_slide(slide_layout)
+        slide.shapes.title.text = title
 
-        slide.shapes.title.text = slide_data.get("titulo","")
-        tf = slide.placeholders[1].text_frame
-        tf.clear()
+        content_placeholder = slide.placeholders[1]
+        content_placeholder.text = ""
 
-        for i,item in enumerate(slide_data.get("contenido",[])[:5]):
-            if i==0:
-                tf.text = item
-            else:
-                p = tf.add_paragraph()
-                p.text = item
+        for bullet in bullets:
+            if bullet.strip():
+                p = content_placeholder.text_frame.add_paragraph()
+                p.text = bullet.replace("-", "").strip()
                 p.level = 1
 
-        for p in tf.paragraphs:
-            p.font.size = Pt(20)
-            p.font.color.rgb = accent
+    ppt_io = io.BytesIO()
+    prs.save(ppt_io)
+    ppt_io.seek(0)
+    return ppt_io
 
-        if slide_data.get("notas"):
-            slide.notes_slide.notes_text_frame.text = slide_data["notas"]
-
-    bio = io.BytesIO()
-    prs.save(bio)
-    bio.seek(0)
-    return bio.read()
-
-# ─────────────────────────────────────
-# STREAMLIT UI
-# ─────────────────────────────────────
-st.title("📚 AI Study Buddy")
-
-if "text_data" not in st.session_state:
-    st.session_state.text_data = ""
-if "summary" not in st.session_state:
-    st.session_state.summary = ""
-if "chat" not in st.session_state:
-    st.session_state.chat = []
+# ─────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────
+st.title("📚 AI Study Assistant PRO")
 
 uploaded_files = st.file_uploader(
     "Sube archivos",
-    type=["pdf","docx","txt","md","pptx","mp3","wav","m4a","mp4","mov"],
+    type=[
+        "pdf","docx","doc","txt","md","rtf","odt",
+        "pptx","csv","xlsx",
+        "mp3","wav","m4a","ogg",
+        "mp4","mov","webm"
+    ],
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    combined = ""
-    for f in uploaded_files:
-        combined += process_file(f) + "\n\n"
-    st.session_state.text_data = combined
-    st.success("Archivos procesados.")
+    full_text = ""
+    for file in uploaded_files:
+        with st.spinner(f"Procesando {file.name}..."):
+            full_text += process_file(file) + "\n\n"
 
-if st.button("Generar resumen"):
-    st.session_state.summary = generate_summary(st.session_state.text_data)
+    st.success("Archivos procesados")
 
-if st.session_state.summary:
-    st.markdown(st.session_state.summary)
+    if st.button("Generar Resumen"):
+        with st.spinner("Generando resumen..."):
+            summary = summarize_text(full_text)
+            st.write(summary)
 
-st.divider()
+    if st.button("Generar Presentación PPT"):
+        with st.spinner("Creando presentación..."):
+            ppt_content = generate_presentation_content(full_text)
+            ppt_file = build_ppt(ppt_content)
 
-# PPT
-st.subheader("🎯 Generar presentación")
-slides = st.slider("Número de diapositivas",6,25,10)
+            st.download_button(
+                "Descargar PPT",
+                ppt_file,
+                file_name="presentacion_generada.pptx"
+            )
 
-if st.button("Generar PPT"):
-    prs_data = generate_presentation_data(st.session_state.text_data,slides)
-    ppt_bytes = build_pptx(prs_data)
-    st.download_button("Descargar PPT",
-                       ppt_bytes,
-                       "presentacion.pptx",
-                       "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    st.divider()
+    st.subheader("Chat sobre el contenido")
 
-st.divider()
+    question = st.text_input("Haz una pregunta")
 
-# CHAT
-st.subheader("💬 Preguntar")
-
-question = st.text_input("Tu pregunta")
-if st.button("Enviar"):
-    answer = ask_question(question, st.session_state.text_data)
-    st.session_state.chat.append(("Tú",question))
-    st.session_state.chat.append(("Claude",answer))
-
-for role,msg in st.session_state.chat:
-    st.markdown(f"**{role}:** {msg}")
+    if question:
+        response = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=2000,
+            messages=[{
+                "role": "user",
+                "content": f"Contenido:\n{full_text}\n\nPregunta:\n{question}"
+            }]
+        )
+        st.write(response.content[0].text)
