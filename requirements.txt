@@ -1,6 +1,10 @@
 streamlit
 anthropic
-pymupdf
 python-docx
-python-pptx
+PyPDF2
+pypandoc
+odfpy
+pandas
+openpyxl
 moviepy
+python-pptx
