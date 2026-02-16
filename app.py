@@ -1,20 +1,20 @@
 import streamlit as st
 import anthropic
-import os
 import io
 import tempfile
 import pandas as pd
+import re
 from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
-from pptx.util import Inches, Pt
-from moviepy import VideoFileClip
-import pypandoc
+from pptx.util import Pt
+from odf.opendocument import load
+from odf import text as odf_text
 
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
-st.set_page_config(page_title="AI Study Assistant", layout="wide")
+st.set_page_config(page_title="AI Study Assistant PRO", layout="wide")
 
 client = anthropic.Anthropic(
     api_key=st.secrets["ANTHROPIC_API_KEY"]
@@ -36,12 +36,12 @@ def extract_txt(file_bytes):
 
 def extract_rtf(file_bytes):
     text = file_bytes.decode("utf-8", errors="ignore")
-    return pypandoc.convert_text(text, "plain", format="rtf", extra_args=["--standalone"])
+    text = re.sub(r'\\[a-z]+\d* ?', '', text)
+    text = text.replace("{", "").replace("}", "")
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
 def extract_odt(file_bytes):
-    from odf.opendocument import load
-    from odf import text as odf_text
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=".odt") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -68,38 +68,23 @@ def extract_xlsx(file_bytes):
     return df.to_string()
 
 # ─────────────────────────────────────────
-# AUDIO / VIDEO
+# AUDIO / VIDEO (DIRECTO A CLAUDE)
 # ─────────────────────────────────────────
-def transcribe_audio(file_bytes, filename):
+def transcribe_media(file_bytes, filename, mime_type):
     response = client.messages.create(
         model="claude-sonnet-4-5-20250929",
         max_tokens=4000,
         messages=[{
             "role": "user",
-            "content": "Transcribe fielmente el siguiente audio."
+            "content": "Transcribe fielmente el contenido multimedia."
         }],
         attachments=[{
             "file_name": filename,
-            "mime_type": "audio/mpeg",
+            "mime_type": mime_type,
             "data": file_bytes
         }]
     )
     return response.content[0].text
-
-def extract_audio_from_video(file_bytes):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
-        tmp_video.write(file_bytes)
-        tmp_video_path = tmp_video.name
-
-    clip = VideoFileClip(tmp_video_path)
-    tmp_audio_path = tmp_video_path.replace(".mp4", ".mp3")
-    clip.audio.write_audiofile(tmp_audio_path)
-
-    with open(tmp_audio_path, "rb") as f:
-        audio_bytes = f.read()
-
-    clip.close()
-    return audio_bytes
 
 # ─────────────────────────────────────────
 # FILE PROCESSOR
@@ -134,11 +119,10 @@ def process_file(uploaded_file):
         return extract_xlsx(file_bytes)
 
     if ext in ["mp3", "wav", "m4a", "ogg"]:
-        return transcribe_audio(file_bytes, name)
+        return transcribe_media(file_bytes, name, "audio/mpeg")
 
     if ext in ["mp4", "mov", "webm"]:
-        audio_bytes = extract_audio_from_video(file_bytes)
-        return transcribe_audio(audio_bytes, name)
+        return transcribe_media(file_bytes, name, "video/mp4")
 
     return ""
 
@@ -167,9 +151,9 @@ Crea una presentación profesional.
 Formato:
 
 SLIDE: Título
-- Punto
-- Punto
-- Punto
+- Punto claro
+- Punto claro
+- Punto claro
 
 Contenido:
 {text}
@@ -183,8 +167,8 @@ Contenido:
 # ─────────────────────────────────────────
 def build_ppt(content):
     prs = Presentation()
-
     slides_raw = content.split("SLIDE:")
+
     for slide_block in slides_raw:
         if slide_block.strip() == "":
             continue
@@ -205,6 +189,7 @@ def build_ppt(content):
                 p = content_placeholder.text_frame.add_paragraph()
                 p.text = bullet.replace("-", "").strip()
                 p.level = 1
+                p.font.size = Pt(20)
 
     ppt_io = io.BytesIO()
     prs.save(ppt_io)
