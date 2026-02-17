@@ -4,6 +4,7 @@ import io
 import tempfile
 import pandas as pd
 import re
+import base64
 from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
@@ -68,22 +69,35 @@ def extract_xlsx(file_bytes):
     return df.to_string()
 
 # ─────────────────────────────────────────
-# AUDIO / VIDEO (DIRECTO A CLAUDE)
+# AUDIO TRANSCRIPTION (API NUEVA)
 # ─────────────────────────────────────────
-def transcribe_media(file_bytes, filename, mime_type):
+def transcribe_audio(file_bytes, mime_type):
+    encoded = base64.b64encode(file_bytes).decode("utf-8")
+
     response = client.messages.create(
         model="claude-sonnet-4-5-20250929",
         max_tokens=4000,
-        messages=[{
-            "role": "user",
-            "content": "Transcribe fielmente el contenido multimedia."
-        }],
-        attachments=[{
-            "file_name": filename,
-            "mime_type": mime_type,
-            "data": file_bytes
-        }]
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Transcribe fielmente el siguiente audio."
+                    },
+                    {
+                        "type": "input_audio",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": encoded
+                        }
+                    }
+                ]
+            }
+        ]
     )
+
     return response.content[0].text
 
 # ─────────────────────────────────────────
@@ -119,10 +133,11 @@ def process_file(uploaded_file):
         return extract_xlsx(file_bytes)
 
     if ext in ["mp3", "wav", "m4a", "ogg"]:
-        return transcribe_media(file_bytes, name, "audio/mpeg")
+        return transcribe_audio(file_bytes, "audio/mpeg")
 
+    # ⚠️ Video no procesado directamente para evitar error API
     if ext in ["mp4", "mov", "webm"]:
-        return transcribe_media(file_bytes, name, "video/mp4")
+        return "⚠️ Video detectado. Actualmente solo se permite audio. Extrae el audio y súbelo como mp3."
 
     return ""
 
@@ -151,9 +166,9 @@ Crea una presentación profesional.
 Formato:
 
 SLIDE: Título
-- Punto claro
-- Punto claro
-- Punto claro
+- Punto clave claro
+- Punto clave claro
+- Punto clave claro
 
 Contenido:
 {text}
