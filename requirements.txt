@@ -1,5 +1,5 @@
 streamlit
-anthropic
+anthropic>=0.34.0
 python-docx
 PyPDF2
 odfpy
