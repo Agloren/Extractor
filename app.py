@@ -4,7 +4,6 @@ import io
 import tempfile
 import pandas as pd
 import re
-import base64
 from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
@@ -69,11 +68,17 @@ def extract_xlsx(file_bytes):
     return df.to_string()
 
 # ─────────────────────────────────────────
-# AUDIO TRANSCRIPTION (API NUEVA)
+# AUDIO TRANSCRIPTION (UPLOAD API CORRECTA)
 # ─────────────────────────────────────────
-def transcribe_audio(file_bytes, mime_type):
-    encoded = base64.b64encode(file_bytes).decode("utf-8")
+def transcribe_audio(file_bytes, filename):
 
+    # 1️⃣ Subir archivo primero
+    uploaded_file = client.files.create(
+        file=(filename, file_bytes),
+        purpose="transcription"
+    )
+
+    # 2️⃣ Crear mensaje usando file_id
     response = client.messages.create(
         model="claude-sonnet-4-5-20250929",
         max_tokens=4000,
@@ -87,11 +92,7 @@ def transcribe_audio(file_bytes, mime_type):
                     },
                     {
                         "type": "input_audio",
-                        "source": {
-                            "type": "base64",
-                            "media_type": mime_type,
-                            "data": encoded
-                        }
+                        "file_id": uploaded_file.id
                     }
                 ]
             }
@@ -133,11 +134,10 @@ def process_file(uploaded_file):
         return extract_xlsx(file_bytes)
 
     if ext in ["mp3", "wav", "m4a", "ogg"]:
-        return transcribe_audio(file_bytes, "audio/mpeg")
+        return transcribe_audio(file_bytes, name)
 
-    # ⚠️ Video no procesado directamente para evitar error API
     if ext in ["mp4", "mov", "webm"]:
-        return "⚠️ Video detectado. Actualmente solo se permite audio. Extrae el audio y súbelo como mp3."
+        return "⚠️ Video detectado. Extrae el audio y súbelo como mp3."
 
     return ""
 
@@ -163,12 +163,13 @@ def generate_presentation_content(text):
             "role": "user",
             "content": f"""
 Crea una presentación profesional.
-Formato:
+
+Formato exacto:
 
 SLIDE: Título
-- Punto clave claro
-- Punto clave claro
-- Punto clave claro
+- Punto claro
+- Punto claro
+- Punto claro
 
 Contenido:
 {text}
